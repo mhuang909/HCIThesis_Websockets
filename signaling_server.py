@@ -1,53 +1,54 @@
-import asyncio
-import websockets
 import logging
 import os
-import http
+from aiohttp import web
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 CONNECTED_CLIENTS = set()
 
-# --- Health Check Hook (Modern 'websockets' API) ---
-# This function runs for EVERY connection request.
-# If it returns a response, the WebSocket handshake is skipped (good for health checks).
-# If it returns None, the WebSocket handshake proceeds (good for your app).
-async def health_check(connection, request):
-    if request.path == "/healthz":
-        return connection.respond(http.HTTPStatus.OK, "OK\n")
-    # If path is NOT /healthz, return None to let the WebSocket connect
+async def websocket_handler(request):
+    """
+    Handles the WebSocket connection and relaying.
+    """
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
 
-async def handler(websocket):
-    """
-    Handle a new WebSocket connection.
-    """
-    # 'remote_address' might not be available behind Render's load balancer, 
-    # so we use a safe fallback for logging
-    client_id = str(websocket.id) 
+    client_id = id(ws)
     logging.info(f"Client connected: {client_id}")
-    CONNECTED_CLIENTS.add(websocket)
-    
+    CONNECTED_CLIENTS.add(ws)
+
     try:
-        async for message in websocket:
-            # Relay message to all OTHER clients
-            # logging.info(f"Relaying message...") # Uncomment to debug
-            recipients = [client for client in CONNECTED_CLIENTS if client != websocket]
-            if recipients:
-                await asyncio.gather(*[client.send(message) for client in recipients])
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                # Relay the message to all OTHER clients
+                # logging.info(f"Relaying message from {client_id}") 
+                for client in list(CONNECTED_CLIENTS):
+                    if client != ws and not client.closed:
+                        await client.send_str(msg.data)
+            elif msg.type == web.WSMsgType.ERROR:
+                logging.info(f"Connection closed with exception {ws.exception()}")
 
-    except websockets.exceptions.ConnectionClosed:
-        logging.info(f"Client disconnected: {client_id}")
     finally:
-        CONNECTED_CLIENTS.remove(websocket)
-
-async def main():
-    # Render provides the port in the environment variable
-    port = int(os.environ.get("PORT", 8765))
-    logging.info(f"--- Starting WebSocket Server on port {port} ---")
+        logging.info(f"Client disconnected: {client_id}")
+        CONNECTED_CLIENTS.discard(ws)
     
-    # pass the health_check function to process_request
-    async with websockets.serve(handler, "0.0.0.0", port, process_request=health_check):
-        await asyncio.Future()  # Run forever
+    return ws
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def health_check(request):
+    """
+    Standard HTTP health check.
+    aiohttp handles GET and HEAD requests automatically.
+    """
+    return web.Response(text="OK")
+
+async def init_app():
+    app = web.Application()
+    # Render sends health checks to /healthz
+    app.add_routes([web.get('/healthz', health_check),
+                    web.get('/', websocket_handler)])
+    return app
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 8765))
+    logging.info(f"--- Starting aiohttp Signaling Server on port {port} ---")
+    web.run_app(init_app(), port=port)
